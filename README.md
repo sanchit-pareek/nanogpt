@@ -45,11 +45,6 @@ Evaluate on HellaSwag:
 ```sh
 python hellaswag.py
 ```
-
-## Video
-
-[Let's reproduce GPT-2 (124M) YouTube lecture](https://youtu.be/l8pRSuU81PU)
-
 ## License
 
 MIT
