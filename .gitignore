@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+venv/
+edu_fineweb10B/
+hellaswag/
+log/
+*.bin
+*.out
+*.log
+.ipynb_checkpoints/
