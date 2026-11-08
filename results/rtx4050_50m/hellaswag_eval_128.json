@@ -1,0 +1,9 @@
+{
+  "checkpoint": "log\\20261108_190741_040502\\latest.pt",
+  "next_step": 3000,
+  "correct": 37,
+  "total": 128,
+  "accuracy": 0.2890625,
+  "dataset_split": "validation",
+  "subset": true
+}

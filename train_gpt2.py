@@ -321,9 +321,12 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 32 # micro batch size
-T = 256 # sequence length
+# Conservative single-GPU starting point for RTX 4050 6GB.
+# Environment overrides let you tune without editing this file.
+B = int(os.environ.get("NANOGPT_BATCH", "1"))
+T = int(os.environ.get("NANOGPT_SEQ_LEN", "512"))
+total_batch_size = int(os.environ.get("NANOGPT_TOKENS_PER_STEP", "16384"))
+assert T <= GPTConfig.block_size, "Sequence length exceeds model context window"
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
@@ -348,8 +351,13 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_steps = int(os.environ.get("NANOGPT_MAX_STEPS", "500"))
+warmup_steps = min(50, max(1, max_steps // 10))
+val_interval = int(os.environ.get("NANOGPT_VAL_INTERVAL", "100"))
+checkpoint_interval = int(os.environ.get("NANOGPT_CKPT_INTERVAL", "100"))
+hella_interval = int(os.environ.get("NANOGPT_HELLA_INTERVAL", "500"))
+# Fast representative subset (not a full HellaSwag validation benchmark).
+hella_examples = int(os.environ.get("NANOGPT_HELLA_EXAMPLES", "128"))
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -366,19 +374,94 @@ def get_lr(it):
 # optimize!
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
-# create the log directory we will write checkpoints to and log to
-log_dir = "log"
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, "w") as f: # open for writing to clear the file
-    pass
+# New experiment directories by default. Resume from a previous experiment with:
+# $env:NANOGPT_RESUME="log/<run_id>/latest.pt" (PowerShell)
+from datetime import datetime, timezone
+import csv
 
-for step in range(max_steps):
+resume_path = os.environ.get("NANOGPT_RESUME", "").strip()
+if resume_path:
+    log_dir = os.path.dirname(os.path.abspath(resume_path))
+    if not os.path.isfile(resume_path):
+        raise FileNotFoundError(resume_path)
+else:
+    run_id = os.environ.get("NANOGPT_RUN_ID")
+    if not run_id:
+        if ddp:
+            raise ValueError("Set NANOGPT_RUN_ID for DDP")
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    log_dir = os.path.join("log", run_id)
+    if master_process:
+        os.makedirs(log_dir, exist_ok=False)
+    if ddp:
+        dist.barrier()
+
+log_file = os.path.join(log_dir, "log.txt")
+metrics_file = os.path.join(log_dir, "metrics.csv")
+if master_process and not os.path.exists(metrics_file):
+    with open(metrics_file, "x", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(["step", "metric", "value"])
+
+def log_metric(step, name, value):
+    if not master_process:
+        return
+    value = float(value)
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(f"{step} {name} {value:.6f}\n")
+    with open(metrics_file, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([step, name, value])
+
+# Save only on an optimizer-step boundary, so the checkpoint can be resumed.
+def save_checkpoint(next_step, val_loss=None):
+    if not master_process:
+        return
+    checkpoint = {
+        "model": raw_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "config": raw_model.config,
+        "next_step": next_step,
+        "val_loss": val_loss,
+        "train_shard": train_loader.current_shard,
+        "train_position": train_loader.current_position,
+        "rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state() if device_type == "cuda" else None,
+        "settings": {
+            "B": B, "T": T, "total_batch_size": total_batch_size,
+            "max_steps": max_steps, "warmup_steps": warmup_steps,
+        },
+    }
+    tmp = os.path.join(log_dir, "latest.pt.tmp")
+    final = os.path.join(log_dir, "latest.pt")
+    torch.save(checkpoint, tmp)
+    os.replace(tmp, final)
+    print(f"checkpoint saved: {final} (resume at step {next_step})", flush=True)
+
+start_step = 0
+if resume_path:
+    # Checkpoints contain a locally defined GPTConfig dataclass; load only files you trust.
+    checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
+    settings = checkpoint.get("settings", {})
+    for name, value in [("B", B), ("T", T), ("total_batch_size", total_batch_size),
+                        ("max_steps", max_steps), ("warmup_steps", warmup_steps)]:
+        if settings.get(name) != value:
+            raise ValueError(f"Resume setting mismatch: {name}: saved={settings.get(name)}, current={value}")
+    raw_model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    start_step = int(checkpoint["next_step"])
+    train_loader.current_shard = int(checkpoint["train_shard"])
+    train_loader.tokens = load_tokens(train_loader.shards[train_loader.current_shard])
+    train_loader.current_position = int(checkpoint["train_position"])
+    torch.set_rng_state(checkpoint["rng_state"])
+    if device_type == "cuda" and checkpoint.get("cuda_rng_state") is not None:
+        torch.cuda.set_rng_state(checkpoint["cuda_rng_state"])
+    print(f"resuming at optimizer step {start_step} from {resume_path}", flush=True)
+
+for step in range(start_step, max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
     # once in a while evaluate our validation loss
-    if step % 250 == 0 or last_step:
+    if (step > 0 and step % val_interval == 0) or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -395,38 +478,43 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 5000 == 0 or last_step):
-                # optionally write model checkpoints
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'config': raw_model.config,
-                    'step': step,
-                    'val_loss': val_loss_accum.item()
-                }
-                # you might also want to add optimizer.state_dict() and
-                # rng seeds etc., if you wanted to more exactly resume training
-                torch.save(checkpoint, checkpoint_path)
+            log_metric(step, "val", val_loss_accum.item())
 
-    # once in a while evaluate hellaswag
-    if (step % 250 == 0 or last_step) and (not use_compile):
+    # Evaluate a fixed subset of HellaSwag, not the complete validation split.
+    if ((step > 0 and step % hella_interval == 0) or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
         for i, example in enumerate(iterate_examples("val")):
+            if i >= hella_examples:
+                break
             # only process examples where i % ddp_world_size == ddp_rank
             if i % ddp_world_size != ddp_rank:
                 continue
             # render the example into tokens and labels
             _, tokens, mask, label = render_example(example)
+            label = int(label)
             tokens = tokens.to(device)
             mask = mask.to(device)
             # get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
-                pred_norm = get_most_likely_row(tokens, mask, logits)
+                    # Four candidates at once may OOM on 6GB. Evaluate one row at a time.
+                    candidate_losses = []
+                    for row_idx in range(tokens.size(0)):
+                        row_tokens = tokens[row_idx:row_idx+1]
+                        row_mask = mask[row_idx:row_idx+1]
+                        row_logits, _ = model(row_tokens)
+                        shift_logits = row_logits[:, :-1, :].contiguous()
+                        shift_tokens = row_tokens[:, 1:].contiguous()
+                        token_loss = F.cross_entropy(
+                            shift_logits.reshape(-1, shift_logits.size(-1)),
+                            shift_tokens.reshape(-1), reduction="none"
+                        )
+                        shifted_mask = row_mask[:, 1:].reshape(-1)
+                        candidate_losses.append(
+                            (token_loss * shifted_mask).sum() / shifted_mask.sum().clamp_min(1)
+                        )
+                    pred_norm = torch.stack(candidate_losses).argmin().item()
             num_total += 1
             num_correct_norm += int(pred_norm == label)
         # reduce the stats across all processes
@@ -439,12 +527,11 @@ for step in range(max_steps):
             num_correct_norm = num_correct_norm.item()
         acc_norm = num_correct_norm / num_total
         if master_process:
-            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} hella {acc_norm:.4f}\n")
+            print(f"HellaSwag SUBSET accuracy ({num_total} examples): {acc_norm:.4f}")
+            log_metric(step, "hella_subset", acc_norm)
 
     # once in a while generate from the model (except step 0, which is noise)
-    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+    if (last_step) and (not use_compile):
         model.eval()
         num_return_sequences = 4
         max_length = 32
@@ -514,8 +601,9 @@ for step in range(max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-        with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
+        log_metric(step, "train", loss_accum.item())
+        if ((step + 1) % checkpoint_interval == 0) or last_step:
+            save_checkpoint(step + 1)
 
 if ddp:
     destroy_process_group()

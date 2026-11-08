@@ -8,3 +8,26 @@ log/
 *.out
 *.log
 .ipynb_checkpoints/
+
+# Local Python environments / caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Generated/tokenized datasets
+edu_fineweb10B/
+edu_fineweb_50M/
+hellaswag/*.jsonl
+
+# Checkpoints and local experiment logs
+log/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.log
+*_console.log
+
+# Temporary scratch files
+.temp/
